@@ -1,0 +1,1603 @@
+package v1
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Aniraku/Aniraku-Backend/internal/api/middleware"
+
+	"github.com/Aniraku/Aniraku-Backend/internal/core"
+	"github.com/Aniraku/Aniraku-Backend/internal/streaming"
+)
+
+func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	var req core.StreamRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.AnimeID == 0 || req.Episode == 0 {
+		h.respondError(w, http.StatusBadRequest, "animeId and episode are required")
+		return
+	}
+
+	if req.Lang == "" {
+		req.Lang = "sub"
+	}
+	if req.Quality == "" {
+		req.Quality = "auto"
+	}
+
+	ctx := r.Context()
+	if req.Refresh {
+		ctx = streaming.WithRefresh(ctx)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+
+	// AniList-keyed: the frontend sends AniList IDs and the Anikoto resolver
+	// maps them directly. MAL IDs are normalized to AniList IDs at the search
+	// boundary, never here.
+	anilistID := req.AnimeID
+
+	// Find best source for the requested provider/lang only
+	result, err := h.stream.GetSourcesForProviderWithSlug(ctx, req.Episode, req.Provider, req.Lang, req.Quality, anilistID, req.Slug)
+
+	if err != nil || result == nil || len(result.Sources) == 0 {
+		h.log.Warn().Err(err).Int("animeId", req.AnimeID).Str("lang", req.Lang).Str("provider", req.Provider).Msg("streaming failed")
+		if err != nil && (strings.Contains(err.Error(), "no source") || strings.Contains(err.Error(), "not found") ||
+			strings.Contains(err.Error(), "no matching show") ||
+			strings.Contains(err.Error(), "not available") || strings.Contains(err.Error(), "blocked") ||
+			strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "filtered")) {
+			h.respondError(w, http.StatusNotFound, "no streaming source found")
+			return
+		}
+		h.respondError(w, http.StatusBadGateway, "streaming source failed")
+		return
+	}
+
+	h.notifyEpisode(anilistID, req.Episode)
+	proxyStreamResult(r, result, req.Lang)
+	h.respondJSON(w, http.StatusOK, h.mintStreamSources(result))
+}
+
+// proxyStreamResult makes the API response safe for browsers. Providers return
+// CDN URLs, but those URLs commonly reject browser CORS requests or require
+// headers that only the server-side proxy can supply. Returning them directly
+// bypasses /api/v1/proxy entirely, which is why the frontend can report a CDN
+// 403 even while proxy requests succeed in the backend logs.
+func proxyStreamResult(r *http.Request, result *core.StreamResult, lang string) {
+	if result == nil {
+		return
+	}
+	result.Sources = proxySources(r, result.Sources, result.Headers, lang)
+}
+
+func proxySources(r *http.Request, sources []core.Source, headers map[string]string, lang string) []core.Source {
+	out := make([]core.Source, len(sources))
+	copy(out, sources)
+	headersJSON, err := json.Marshal(headers)
+	if err != nil {
+		return out
+	}
+	headersParam := url.QueryEscape(string(headersJSON))
+	proxyBase := requestPublicBaseURL(r)
+	// Audio language for dual-audio masters: the proxy strips the wrong
+	// AUDIO rendition at rewrite time (see stripAudioRenditions in
+	// proxy_audio.go). Attached only to krussdomi/kaa HLS sources:
+	// they are the only dual-audio masters in the
+	// catalog; every other provider serves single-audio muxed streams
+	// where the strip is a guaranteed no-op.
+	wantAl := lang == "sub" || lang == "dub"
+	for i := range out {
+		source := &out[i]
+		// Subtitle tracks ride the same proxy as the video. Their CDNs
+		// answer 403 without the provider's UA/Referer/cookies, and those
+		// headers only exist server-side, so a raw subtitle URL cannot be
+		// fetched by the client on most providers.
+		// Deep copy first: out is a shallow copy, so writing through the
+		// Subtitles slice would bake this request's proxyBase into the
+		// provider's cached result (the bug pinned for source URLs by
+		// TestProxySourcesNoCrossRequestPoison).
+		if len(source.Subtitles) > 0 {
+			subs := make([]core.Subtitle, len(source.Subtitles))
+			copy(subs, source.Subtitles)
+			for j := range subs {
+				subs[j].URL = proxyMediaURL(proxyBase, subs[j].URL, headersParam)
+			}
+			source.Subtitles = subs
+		}
+		st := strings.ToLower(source.Type)
+		if (st != "hls" && st != "mp4") || source.URL == "" {
+			continue
+		}
+		alParam := ""
+		if wantAl && wantsAudioStrip(source.URL) {
+			alParam = "&al=" + lang
+		}
+		source.URL = proxyMediaURL(proxyBase, source.URL, headersParam) + alParam
+	}
+	// The input slice is never mutated: provider resolve caches share their
+	// SourceResult backing arrays across requests, and wrapping in place
+	// baked the first request's proxyBase + al into every later response
+	// (observed: local 127.0.0.1 links and al=dub served on production sub
+	// requests). Callers use the returned copy.
+	return out
+}
+
+// proxyMediaURL wraps one upstream media URL (video, playlist, subtitle)
+// into a backend proxy link in the url= + headers= form the client already
+// understands. Already-proxied URLs and anything not absolute http(s) come
+// back untouched: re-wrapping a self-proxy URL would make the proxy fetch
+// itself (127.0.0.1 → 403 at the allowlist), and a relative URL is not
+// fetchable upstream at all.
+func proxyMediaURL(proxyBase, rawURL, headersParam string) string {
+	if rawURL == "" || strings.Contains(rawURL, "/api/v1/proxy?") ||
+		(!strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://")) {
+		return rawURL
+	}
+	return fmt.Sprintf("%s/api/v1/proxy?url=%s&headers=%s", proxyBase, url.QueryEscape(rawURL), headersParam)
+}
+
+// isKaaHLSSource reports whether an upstream URL is a krussdomi/kaa HLS
+// source (hls/bl.krussdomi.com manifests, including animex-Sora's kaamx
+// mirrors). Only these carry dual-audio masters, so only these qualify
+// for the al=sub/dub audio strip. A false positive is harmless: the
+// strip leaves playlists without a matching AUDIO group byte-identical.
+func isKaaHLSSource(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return strings.Contains(host, "krussdomi") || strings.Contains(host, "kaa")
+}
+
+// isFlixcloudSource reports flixcloud HLS masters: every one is dual-audio
+// (jpn "Native" + eng "English" EXT-X-MEDIA renditions), so they qualify
+// for the al=sub/dub strip exactly like kaa.
+func isFlixcloudSource(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(u.Hostname()), "flixcloud.cc")
+}
+
+// wantsAudioStrip reports whether this source's master carries dual audio
+// the al=sub/dub strip should act on.
+func wantsAudioStrip(rawURL string) bool {
+	return isKaaHLSSource(rawURL) || isFlixcloudSource(rawURL)
+}
+
+// withAudioLang appends al=<lang> to a master URL so the proxy's rewrite
+// strips the wrong audio rendition. Used by the k-link mint, whose sealed
+// URL is the ONLY thing the proxy sees — without this the strip context is
+// lost and sub/dub selections play identical (default jpn) audio.
+func withAudioLang(rawURL, lang string) string {
+	if lang != "sub" && lang != "dub" {
+		return rawURL
+	}
+	if !wantsAudioStrip(rawURL) {
+		return rawURL
+	}
+	sep := "?"
+	if strings.Contains(rawURL, "?") {
+		sep = "&"
+	}
+	return rawURL + sep + "al=" + lang
+}
+
+func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("id")
+	epStr := r.URL.Query().Get("ep")
+	lang := r.URL.Query().Get("lang")
+	if lang == "" {
+		lang = "sub"
+	}
+
+	if idStr == "" || epStr == "" {
+		h.respondError(w, http.StatusBadRequest, "id and ep are required")
+		return
+	}
+
+	animeID, err := strconv.Atoi(idStr)
+	episode, err2 := strconv.Atoi(epStr)
+	if err != nil || err2 != nil || animeID <= 0 || episode <= 0 {
+		h.respondError(w, http.StatusBadRequest, "invalid id or ep")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+
+	// Legacy endpoint: delegate to the streaming manager (anikoto/flixcloud).
+	result, err := h.stream.GetSourcesForProvider(ctx, episode, "", lang, "auto", animeID)
+	if err != nil || result == nil || len(result.Sources) == 0 {
+		h.respondError(w, http.StatusNotFound, "no streaming source found")
+		return
+	}
+
+	proxyStreamResult(r, result, lang)
+	h.respondJSON(w, http.StatusOK, h.mintStreamSources(result))
+}
+
+func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("animeId")
+	epStr := r.URL.Query().Get("episode")
+	lang := r.URL.Query().Get("lang")
+	genresStr := r.URL.Query().Get("genres")
+
+	if idStr == "" || epStr == "" {
+		h.respondError(w, http.StatusBadRequest, "animeId and episode are required")
+		return
+	}
+	if lang == "" {
+		lang = "sub"
+	}
+
+	animeID, err := strconv.Atoi(idStr)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid animeId")
+		return
+	}
+	episode, err := strconv.Atoi(epStr)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid episode")
+		return
+	}
+
+	// Parse genres from comma-separated query param (e.g. "Hentai" or "Action,Comedy").
+	var genres []string
+	if genresStr != "" {
+		for _, g := range strings.Split(genresStr, ",") {
+			g = strings.TrimSpace(g)
+			if g != "" {
+				genres = append(genres, g)
+			}
+		}
+	}
+
+	// The manager bounds lookup, fan-out, and merging to 15 seconds. Keep a
+	// small handler margin for URL wrapping and JSON encoding.
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true" {
+		ctx = streaming.WithRefresh(ctx)
+	}
+	// AniList-keyed; IDs are normalized at the search boundary.
+	anilistID := animeID
+
+	servers := h.stream.FindAllServers(ctx, anilistID, episode, lang, genres)
+	for i := range servers {
+		servers[i].Sources = proxySources(r, servers[i].Sources, servers[i].Headers, lang)
+	}
+	if servers == nil {
+		servers = []core.Server{}
+	}
+	if hasSources(servers) {
+		h.notifyEpisode(anilistID, episode)
+	}
+	h.respondJSON(w, http.StatusOK, h.mintSourcesForClient(servers))
+}
+
+// blockedProxyPorts are well-known non-HTTP service ports the media proxy
+// refuses to dial. Everything else is allowed: CDNs legitimately serve video
+// on other ports (observed: a1.mp4upload.com:183). The authoritative SSRF
+// boundary stays in the dialer's resolved-IP control hook; the port list
+// only stops accidental fetches of SSH/database/mail daemons.
+var blockedProxyPorts = map[string]bool{
+	"21": true, "22": true, "23": true, "25": true, "53": true,
+	"110": true, "143": true, "389": true, "445": true, "465": true, "587": true,
+	"993": true, "995": true, "1433": true, "1521": true, "2049": true,
+	"2375": true, "3306": true, "3389": true, "5432": true, "5900": true,
+	"6379": true, "9200": true, "11211": true, "27017": true,
+}
+
+// isSubtitleURL matches subtitle track URLs (extensions and known caption
+// endpoints) so the proxy can label them parseable instead of downloadable.
+func isSubtitleURL(pathLower string) bool {
+	for _, m := range []string{".vtt", ".srt", "/captions", "/subtitle", "/subs/"} {
+		if strings.Contains(pathLower, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// mintSourcesForClient swaps every source URL (and the server's header set)
+// for an opaque /proxy?k= link when PROXY_LINK_KEY is configured. The raw
+// provider URLs and the scraper-session cookies/headers never reach the
+// client: they are sealed inside the token, and the visible "headers"
+// fields are dropped. Without the key the responses pass through unchanged
+// (legacy raw-URL behavior, app compatibility).
+func (h *Handlers) mintSourcesForClient(servers []core.Server) []core.Server {
+	if len(proxyLinkKeyBytes) != 32 {
+		return servers
+	}
+	out := make([]core.Server, 0, len(servers))
+	for _, srv := range servers {
+		srcs := make([]core.Source, 0, len(srv.Sources))
+		for _, src := range srv.Sources {
+			if src.URL == "" {
+				continue
+			}
+			if link, err := mintProxyLink(src.URL, srv.Headers); err == nil {
+				src.URL = link
+			}
+			// Subtitle tracks get their own opaque link: a raw URL here
+			// would bypass the proxy and lose the sealed UA/Referer the
+			// CDN requires. Deep copy, src shares the Subtitles backing
+			// array with the cached server result.
+			if len(src.Subtitles) > 0 {
+				subs := make([]core.Subtitle, len(src.Subtitles))
+				copy(subs, src.Subtitles)
+				for j := range subs {
+					if link, err := mintProxyLink(subs[j].URL, srv.Headers); err == nil {
+						subs[j].URL = link
+					}
+				}
+				src.Subtitles = subs
+			}
+			srcs = append(srcs, src)
+		}
+		if len(srcs) == 0 {
+			continue
+		}
+		srv.Sources = srcs
+		srv.Headers = nil // scraper-session headers are sealed in the links
+		out = append(out, srv)
+	}
+	return out
+}
+
+// mintStreamSources seals a StreamResult's sources the same way.
+func (h *Handlers) mintStreamSources(result *core.StreamResult) *core.StreamResult {
+	if len(proxyLinkKeyBytes) != 32 || result == nil {
+		return result
+	}
+	srcs := make([]core.Source, 0, len(result.Sources))
+	for _, src := range result.Sources {
+		if src.URL == "" {
+			continue
+		}
+		if link, err := mintProxyLink(src.URL, result.Headers); err == nil {
+			src.URL = link
+		}
+		if len(src.Subtitles) > 0 {
+			subs := make([]core.Subtitle, len(src.Subtitles))
+			copy(subs, src.Subtitles)
+			for j := range subs {
+				if link, err := mintProxyLink(subs[j].URL, result.Headers); err == nil {
+					subs[j].URL = link
+				}
+			}
+			src.Subtitles = subs
+		}
+		srcs = append(srcs, src)
+	}
+	if len(srcs) > 0 {
+		result.Sources = srcs
+		result.Headers = nil // sealed in the links
+	}
+	return result
+}
+
+func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: nothing here is stored. Cacheable branches below (playlists,
+	// segments, subtitles, keys) overwrite this with explicit public
+	// directives; errors and rejections keep no-store. Only allowlisted
+	// origins are echoed, reflecting an arbitrary Origin would let any
+	// website read what the proxy fetches. Unknown/absent origins get '*':
+	// media here is public (allowlisted CDNs only) and no proxy request is
+	// made with credentials, so '*' never breaks playback.
+	w.Header().Set("Cache-Control", "no-store, private")
+	origin := r.Header.Get("Origin")
+	switch {
+	case middleware.IsAllowedOrigin(origin):
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	default:
+		// Absent or unknown origin: media here is public (allowlisted CDNs
+		// only) and the proxy is never called with credentials, so '*' is
+		// safe and keeps playback working from any origin without letting
+		// untrusted sites read credentialed responses.
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	}
+
+	// Opaque-link route (PROXY_LINK_KEY): the client holds /proxy?k=<token>
+	// instead of raw provider URLs + scraper cookies. Resolves server-side
+	// into the raw URL + sealed headers, then flows through the normal
+	// path below. Legacy ?url= + headers= keep working (app compatibility).
+	if kToken := r.URL.Query().Get("k"); kToken != "" {
+		rawURL, sealedHeaders, err := resolveProxyLink(kToken)
+		if err != nil {
+			h.respondError(w, http.StatusNotFound, "expired or invalid media link")
+			return
+		}
+		h.log.Info().Str("kroute_resolved", rawURL).Msg("proxy: opaque link resolved")
+		q := r.URL.Query()
+		q.Del("k")
+		q.Set("url", rawURL)
+		// Promote the audio-strip context: the mint seals al= INSIDE the
+		// master URL (withAudioLang at mint time), but the rewrite reads it
+		// from the REQUEST query — without promotion a sealed al never
+		// reaches stripAudioRenditions and sub/dub play identical audio.
+		if sealedURL, sErr := url.Parse(rawURL); sErr == nil {
+			if alv := sealedURL.Query().Get("al"); alv != "" && q.Get("al") == "" {
+				q.Set("al", alv)
+			}
+		}
+		if len(sealedHeaders) > 0 {
+			if hj, jerr := json.Marshal(sealedHeaders); jerr == nil {
+				q.Set("headers", string(hj))
+			}
+		}
+		r.URL.RawQuery = q.Encode()
+	}
+
+	targetURL := r.URL.Query().Get("url")
+	if targetURL == "" {
+		h.respondError(w, http.StatusBadRequest, "url parameter required")
+		return
+	}
+
+	decodedURL, err := url.QueryUnescape(targetURL)
+	if err != nil {
+		decodedURL = targetURL
+	}
+	// Drop the cache-busting nonce (see rewriteHLSPlaylist) so the upstream
+	// CDN never sees it.
+	decodedURL = stripProxyNonce(decodedURL)
+
+	// SSRF guard: cheap fast-fail on obviously bad hostnames. The dialer
+	// Control hook (ssrfGuardControl) remains the authoritative boundary for
+	// resolved-IP checks covering DNS rebinding, redirects, and alt encodings.
+	parsed, err := url.Parse(decodedURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		h.respondError(w, http.StatusBadRequest, "invalid URL scheme")
+		return
+	}
+	if port := parsed.Port(); port != "" && blockedProxyPorts[port] {
+		h.respondError(w, http.StatusForbidden, "proxy target port not allowed")
+		return
+	}
+	if host := strings.ToLower(parsed.Hostname()); isNuisanceProxyHost(host) {
+		h.log.Warn().Str("proxy_host", host).Msg("proxy nuisance-ad host blocked")
+		h.respondError(w, http.StatusForbidden, "proxy target blocked")
+		return
+	} else if validateProxyTarget(host) != nil {
+		h.respondError(w, http.StatusForbidden, "proxy target not allowed")
+		return
+	} else if !isAllowedProxyHost(host) {
+		// The dialer SSRF guard keeps private targets out; the CDN suffix
+		// allowlist keeps the proxy from being a general public relay.
+		h.log.Warn().Str("proxy_host", host).Msg("proxy host not on CDN allowlist")
+		h.respondError(w, http.StatusForbidden, "proxy target not allowed")
+		return
+	}
+
+	// Create request with proper headers
+	req, err := http.NewRequestWithContext(r.Context(), "GET", decodedURL, nil)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid URL")
+		return
+	}
+
+	// Set headers from query param
+	headersJSON := r.URL.Query().Get("headers")
+	applyProxyQueryHeaders(req, headersJSON)
+
+	// Audio language (set by proxySources from the request's lang): dual-
+	// audio masters get the wrong AUDIO rendition stripped during the HLS
+	// rewrite so sub/dub can never play each other's track (see
+	// stripAudioRenditions). Anything other than sub/dub disables the strip.
+	al := r.URL.Query().Get("al")
+	if al != "sub" && al != "dub" {
+		al = ""
+	}
+
+	// Short-lived VOD playlist cache (see streaming.vod_cache.go). The
+	// collector's segment probe fetched this exact upstream body seconds
+	// before the player asked for it, and the browser's prewarm fires HEADs
+	// that would each cost another full upstream round-trip, burst traffic
+	// that trips relay rate limits (krussdomi 429s the first playback
+	// attempt otherwise, which the frontend reports as "blocked"). Stored
+	// bytes are always RAW upstream content; the rewrite runs per request so
+	// proxyBase, the al strip and the rn nonce are never shared across hits.
+	// Reached only after the SSRF/allowlist gates above, so the cache can
+	// never answer a request the proxy would not have fetched itself.
+	cachedBody, vok := streaming.VODCacheGet(decodedURL)
+	if vok && isFlixcloudSource(decodedURL) {
+		// Token-bound: the master URL carries a single-use IP-bound JWT and
+		// every body is wrapped in a key generation that rotates per page
+		// render, so a stored copy can outlive its token or arrive wrapped
+		// with a key this page no longer yields. Go upstream every time.
+		vok = false
+	}
+	if vok {
+		// Defensive: cache entries written by paths that stored raw could
+		// still carry the flixcloud base64(XOR) wrapper; the decode is
+		// idempotent for plaintext, so apply it unconditionally here.
+		cachedBody = streaming.DecodeFlixcloudPlaylist(cachedBody)
+		if strings.Contains(strings.ToLower(parsed.Hostname()), "flixcloud.cc") &&
+			!looksLikeM3u8Bytes(cachedBody) && len(cachedBody) > 32 {
+			// The cached entry itself is undecodable (wrapped in a key
+			// generation the key set does not cover) — drop it and fall
+			// through to a fresh fetch, whose flixcloud branch carries the
+			// bust+refresh retry. Serving this entry raw would feed the
+			// player base64 noise forever.
+			streaming.VODCacheDrop(decodedURL)
+		} else {
+			if r.Method == http.MethodHead {
+				// No Content-Length: the GET representation is the REWRITTEN
+				// playlist whose length differs from these raw bytes,
+				// reporting the raw length lies to download managers.
+				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			h.serveRewrittenPlaylist(w, r, cachedBody, decodedURL, headersJSON, al, http.StatusOK)
+			return
+		}
+	}
+
+	// AnimeX CDN proxy: decode the /uwu/ token to extract the Referer header	// AnimeX CDN proxy: decode the /uwu/ token to extract the Referer header
+	// that the CDN requires. The token format is base64url(xor(url\0referer\0ua, key)).
+	if strings.Contains(decodedURL, "cdnx.aniwatchtv.site/uwu/") {
+		_, ref, ua := streaming.DecodeAnimeXProxyURL(decodedURL)
+		if ref != "" {
+			req.Header.Set("Referer", ref)
+		}
+		if ua != "" && req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", ua)
+		}
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+		}
+	}
+
+	// FlixCloud: segments (vault-N.vividcdn.top etc.) answer 403 to
+	// headerless fetches, and the sealed Referer from the k-token already
+	// rides on every rewritten child URI, so nothing extra is set here. The
+	// m3u8 bodies on the fetch hosts are additionally wrapped in
+	// base64(XOR(_, pk)); that decode happens right before classification.
+	// The old IP-bound JWT flow (client_ip claim validated against the TCP
+	// source) is gone — direct masters carry no signature at all now.
+
+	// Forward the client's Range header for media/segment requests so the
+	// video element can seek through the proxy. Without it every seek turns
+	// into a fresh full-body download and playback restarts from the start.
+	// Playlists and keys are excluded, their paths need full bodies (HLS
+	// rewrite / key cache), and neither hls.js nor native HLS ranges them.
+	if rng := r.Header.Get("Range"); rng != "" {
+		p := strings.ToLower(parsed.Path)
+		if !strings.HasSuffix(p, ".m3u8") && !strings.HasSuffix(p, ".m3u") && !strings.HasSuffix(p, ".key") {
+			req.Header.Set("Range", rng)
+		}
+	}
+
+	// Cache key responses, hls.js makes one request per unique KEY URI
+	// (we append &sn=N to each per-segment KEY tag). The backend strips sn
+	// from the upstream URL, so every request fetches the same CDN key URL.
+	cacheKeyURL := decodedURL
+	if idx := strings.IndexByte(decodedURL, '?'); idx >= 0 {
+		baseQ, _ := url.ParseQuery(decodedURL[idx+1:])
+		for _, skip := range []string{"sn", "iv", "t"} {
+			baseQ.Del(skip)
+		}
+		if clean := baseQ.Encode(); clean != "" {
+			cacheKeyURL = decodedURL[:idx+1] + clean
+		} else {
+			cacheKeyURL = decodedURL[:idx]
+		}
+	}
+	isKey := strings.HasSuffix(strings.ToLower(parsed.Path), ".key")
+
+	if isKey && !isFlixcloudSource(decodedURL) {
+		if cached, ok := h.keyCache.Load(cacheKeyURL); ok {
+			if entry, ok := cached.(keyCacheEntry); ok && time.Since(entry.fetchedAt) < 5*time.Minute {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				cacheableMediaHeaders(w, "public, max-age=300")
+				w.WriteHeader(http.StatusOK)
+				w.Write(entry.data)
+				return
+			}
+			h.keyCache.Delete(cacheKeyURL)
+		}
+	}
+
+	// Emergency fill limiter (added after the OOM wedges): every
+	// cache miss downstream of here holds an upstream connection for the
+	// whole paced copy, so fills must be capped or an evening spike pushes
+	// the 836 MB box into swap thrash. Taken AFTER all local gates (SSRF,
+	// allowlist, VOD/key cache hits) so garbage URLs and cache hits never
+	// consume slots, and held across the single retry below so a retry
+	// cannot double-dial past the cap.
+	released, limiterOK := proxyFills.acquire(r.Context())
+	if !limiterOK {
+		w.Header().Set("Retry-After", "3")
+		h.log.Warn().Str("proxy_host", parsed.Hostname()).Msg("proxy fill limiter shed upstream fetch")
+		h.respondError(w, http.StatusServiceUnavailable, "proxy busy, retry shortly")
+		return
+	}
+	defer released()
+
+	// Relay CDNs rate-limit bursts with 429 (krussdomi answers "slow down"
+	// mid-first-playback). One quiet retry after a short pause turns that
+	// blip into a success instead of a failed playback start; anything
+	// still limited after the retry fails fast through the rejection below.
+	// The same one-shot applies to a 403: Cloudflare challenges this egress
+	// intermittently (measured: the same URL, same headers, a 200 one
+	// moment and a "Just a moment" interstitial 403 the next), and without
+	// the retry a single challenged segment mid-episode killed playback.
+	pathLower := strings.ToLower(parsed.Path)
+	isPlaylistPath := strings.HasSuffix(pathLower, ".m3u8") || strings.HasSuffix(pathLower, ".m3u")
+	resp, err := h.doRequest(req, parsed.Scheme == "https")
+	if err == nil && r.Method == http.MethodGet &&
+		(resp.StatusCode == http.StatusForbidden ||
+			(resp.StatusCode == http.StatusTooManyRequests && isPlaylistPath)) {
+		resp.Body.Close()
+		select {
+		case <-r.Context().Done():
+			resp, err = nil, r.Context().Err()
+		case <-time.After(600 * time.Millisecond):
+			resp, err = h.doRequest(req.Clone(r.Context()), parsed.Scheme == "https")
+		}
+	}
+	if err != nil {
+		errStr := err.Error()
+		h.log.Warn().Err(err).Str("proxy_url", decodedURL).Msg("proxy upstream connection failed")
+		if strings.Contains(errStr, "connection refused") ||
+			strings.Contains(errStr, "no route to host") ||
+			strings.Contains(errStr, "i/o timeout") {
+			h.respondError(w, http.StatusBadGateway, "CDN_BLOCKED: upstream refused connection - CDN blocks datacenter IPs")
+			return
+		}
+		h.respondError(w, http.StatusBadGateway, "upstream request failed")
+		return
+	}
+	defer resp.Body.Close()
+
+	// ponytail: debug, log upstream status for proxy issues
+	h.log.Debug().Str("proxy_url", decodedURL).Int("upstream_status", resp.StatusCode).Msg("proxy upstream response")
+
+	// The media proxy is not a navigation relay. A 3xx response can direct a
+	// native embedded session to an unreviewed interstitial or popup landing
+	// page; refuse it instead of passing its Location header to the client.
+	if proxyRedirectBlocked(resp.StatusCode) {
+		h.log.Warn().Str("proxy_url", decodedURL).Int("upstream_status", resp.StatusCode).Msg("proxy upstream redirect blocked")
+		h.respondError(w, http.StatusBadGateway, "upstream media redirect blocked")
+		return
+	}
+
+	if resp.StatusCode == 403 || resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == http.StatusTooManyRequests {
+		errStr := fmt.Sprintf("upstream returned %d", resp.StatusCode)
+		h.log.Warn().Str("proxy_url", decodedURL).Int("upstream_status", resp.StatusCode).Msg("proxy upstream rejected")
+		if resp.StatusCode == http.StatusTooManyRequests {
+			// Never forward a 429 body: it is rate-limit error text, and the
+			// playlist rewrite would mangle it into a fake URL that hls.js
+			// fails on with a confusing parse error instead of a clean retry.
+			h.respondError(w, http.StatusBadGateway, "CDN_BLOCKED: upstream rate limited (HTTP 429)")
+			return
+		}
+		if resp.StatusCode == 502 || resp.StatusCode == 403 {
+			h.respondError(w, http.StatusBadGateway, "CDN_BLOCKED: upstream rejected (HTTP "+strconv.Itoa(resp.StatusCode)+")")
+			return
+		}
+		h.respondError(w, http.StatusBadGateway, errStr)
+		return
+	}
+
+	// Learning happens where a trusted playlist names its media hosts
+	// (rewriteHLSPlaylist), not here. Recording the host at this point could
+	// never learn anything: this code is only reachable once the allowlist
+	// gate above has already passed.
+
+	if isKey && !isFlixcloudSource(decodedURL) && resp.StatusCode == http.StatusOK {
+		// Emergency memory guard: the key read is capped so a
+		// misrouted or hostile .key URL cannot be slurped into RAM in
+		// full. Real keys are 16 bytes; anything at or beyond the cap
+		// falls through to the generic streaming path WITHOUT caching.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, keyCacheMaxRead))
+		if len(body) < keyCacheMaxRead {
+			resp.Body.Close()
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			h.keyCache.Store(cacheKeyURL, keyCacheEntry{data: body, fetchedAt: time.Now()})
+
+			w.Header().Set("Content-Type", "application/octet-stream")
+			cacheableMediaHeaders(w, "public, max-age=300")
+			w.WriteHeader(http.StatusOK)
+			w.Write(body)
+			return
+		}
+		resp.Body = streamKeepCloser(bytes.NewReader(body), resp.Body)
+	}
+
+	// Check if this is an HLS playlist, use parsed path, not raw URL (query
+	// params break HasSuffix). pathLower is computed once before the dial.
+	// The RawQuery check covers query-suffixed masters (/cdn/<hash>?t.m3u8);
+	// the body sniff below covers extension-less legs served with a cloaked
+	// content type (echovideo serves everything as image/jpeg).
+	contentType := resp.Header.Get("Content-Type")
+	isHLS := strings.Contains(contentType, "mpegurl") || strings.Contains(contentType, "m3u8") ||
+		strings.HasSuffix(pathLower, ".m3u8") || strings.HasSuffix(pathLower, ".m3u") ||
+		strings.Contains(strings.ToLower(parsed.RawQuery), "m3u8")
+
+	if isHLS {
+		// Emergency memory guard: this read used to consume
+		// the ENTIRE upstream body. A huge mislabeled body behind a
+		// playlist-looking URL hit RAM in full, on the 836 MB box, three
+		// of those are an OOM. Playlists are tens of KiB (the VOD cache
+		// itself refuses bodies over vodCacheMaxBody = 256 KiB), so read
+		// at most hlsMaxRead and route any remainder through a joined
+		// reader when classification says media instead of playlist.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, hlsMaxRead))
+		if err != nil {
+			h.respondError(w, http.StatusBadGateway, "failed to read HLS playlist")
+			return
+		}
+		// FlixCloud wraps every m3u8 body in base64(XOR(plaintext, pk)) where
+		// pk is baked into the embed page's wasm data section. Unwrap BEFORE
+		// classification — the wrapped body is base64 text, not #EXTM3U, and
+		// would be rejected as garbage. DecodeFlixcloudPlaylist passes
+		// already-plaintext bodies through, so this is a no-op for anything
+		// else the CDN serves.
+		if strings.HasSuffix(strings.ToLower(parsed.Hostname()), "flixcloud.cc") {
+			body = streaming.DecodeFlixcloudPlaylist(body)
+			if !looksLikeM3u8Bytes(body) && len(body) > 32 {
+				// Every known key failed on THESE bytes: Cloudflare's edge
+				// serves mixed key-generations of the encrypted playlist
+				// (older cache nodes hold copies wrapped by a previous
+				// flixcloud build). Bust the CDN cache, refetch once, refresh
+				// the key set from a live page, and decode again.
+				busted := decodedURL
+				if idx := strings.IndexByte(busted, '?'); idx >= 0 {
+					busted += "&fcb=" + strconv.FormatInt(time.Now().UnixNano(), 36)
+				} else {
+					busted += "?fcb=" + strconv.FormatInt(time.Now().UnixNano(), 36)
+				}
+				req2 := req.Clone(r.Context())
+				req2.URL, _ = url.Parse(busted)
+				streaming.FlixcloudRefreshKeys(r.Context())
+				if resp2, err2 := h.doRequest(req2, parsed.Scheme == "https"); err2 == nil {
+					body2, err2 := io.ReadAll(io.LimitReader(resp2.Body, hlsMaxRead))
+					resp2.Body.Close()
+					if err2 == nil {
+						body2 = streaming.DecodeFlixcloudPlaylist(body2)
+						if looksLikeM3u8Bytes(body2) {
+							body = body2
+							logUnwrappedFlixcloud(h, busted, "refetch-ok", body)
+						} else {
+							logUnwrappedFlixcloud(h, busted, "refetch-still-wrapped", body2)
+						}
+					}
+				}
+			}
+			logUnwrappedFlixcloud(h, decodedURL, "fresh", body)
+		}
+		switch classifyPlaylistResponse(resp.StatusCode, resp.Header.Get("Content-Range"), body) {
+		case playlistReject:
+			// Upstream error text or a TRUNCATED playlist, running either
+			// through the rewrite would mangle it into a fake URL and hls.js
+			// would die on a confusing parse error. Answer with a clean
+			// upstream-rejection error instead.
+			h.log.Warn().Str("proxy_url", decodedURL).Int("upstream_status", resp.StatusCode).Msg("playlist upstream rejected")
+			h.respondError(w, http.StatusBadGateway, "upstream returned "+strconv.Itoa(resp.StatusCode))
+			return
+		case playlistMedia:
+			// The hint misfired (a media file whose token happens to contain
+			// "m3u8"), or a ranged media body behind a playlist-looking URL:
+			// never run binary through the playlist mangler. Re-attach BOTH
+			// the capped head and the uncapped remainder and stream them
+			// opaque below (the normal 206 passthrough echoes Content-Range
+			// so seeking still works).
+			resp.Body = streamKeepCloser(bytes.NewReader(body), resp.Body)
+		case playlistServe:
+			// The capped read cannot distinguish "exactly hlsMaxRead bytes"
+			// from a playlist that continues past the cap. Serving the
+			// former is fine; rewriting from a TRUNCATED playlist would
+			// emit fake child URLs, so refuse it with a clean 502 instead.
+			// Playlists are tens of KiB; this fires only on pathological
+			// upstreams and costs nothing in the normal path.
+			if len(body) >= hlsMaxRead {
+				h.log.Warn().Str("proxy_url", decodedURL).Int("playlist_bytes", len(body)).Msg("playlist exceeds proxy read cap")
+				h.respondError(w, http.StatusBadGateway, "upstream playlist too large")
+				return
+			}
+			// Keep the RAW pre-rewrite body for the short VOD window: the next
+			// request for this URL (any lang, any proxyBase) rewrites it fresh.
+			if !isFlixcloudSource(decodedURL) {
+				streaming.VODCacheSet(decodedURL, body)
+			}
+			h.serveRewrittenPlaylist(w, r, body, decodedURL, headersJSON, al, http.StatusOK)
+			return
+		}
+	}
+	// Extension-less playlist legs (echovideo variant/media URLs are bare
+	// /cdn/<hash>, cloaked as image/jpeg): no hint fires, so sniff the
+	// first bytes. Serving a playlist raw leaves its relative child URIs
+	// pointing at our own domain and playback blacks out, exactly the
+	// failure this guards.
+	if !isHLS && resp.StatusCode == http.StatusOK {
+		if peek, perr := io.ReadAll(io.LimitReader(resp.Body, 1024)); perr == nil {
+			if isPlaylistBody(peek) {
+				if rest, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20)); rerr == nil {
+					body := append(peek, rest...)
+					if !isFlixcloudSource(decodedURL) {
+						streaming.VODCacheSet(decodedURL, body)
+					}
+					h.serveRewrittenPlaylist(w, r, body, decodedURL, headersJSON, al, resp.StatusCode)
+					return
+				}
+			}
+			resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peek), resp.Body))
+		}
+	}
+	// Stream non-HLS content directly through the proxy.
+	// Force correct Content-Type for TS segments, CDN lies with "image/jpeg"
+	// to bypass Cloudflare media blocking.
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	if strings.HasSuffix(pathLower, ".jpg") || strings.HasSuffix(pathLower, ".ts") {
+		if !strings.HasSuffix(pathLower, ".m3u8") && !strings.HasSuffix(pathLower, ".key") {
+			ct = "video/mp2t"
+		}
+	}
+	if strings.HasSuffix(pathLower, ".key") {
+		ct = "application/octet-stream"
+	}
+	// Subtitle tracks served as downloadable blobs (moe /captions answers
+	// application/octet-stream): players need text/vtt to parse cues and
+	// otherwise download the file. Override only generic binary types,
+	// never a specific upstream type, working .vtt subtitles pass through
+	// untouched.
+	if isSubtitleURL(pathLower) && (ct == "" || ct == "application/octet-stream" || ct == "application/binary") {
+		ct = "text/vtt; charset=utf-8"
+	}
+
+	// Partial-content responses (206) from a forwarded Range: pass through
+	// Content-Range and advertise Accept-Ranges so the video element knows it
+	// can seek. Content-Length is echoed only for 206 to keep the response
+	// non-chunked; for full-body (200) streaming we omit it so Go uses
+	// chunked transfer encoding, this prevents ERR_CONTENT_LENGTH_MISMATCH
+	// when the upstream CDN drops the connection or returns fewer bytes than
+	// its Content-Length promised.
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		w.Header().Set("Content-Range", cr)
+	}
+	if ar := resp.Header.Get("Accept-Ranges"); ar != "" {
+		w.Header().Set("Accept-Ranges", ar)
+	} else if resp.StatusCode == http.StatusPartialContent {
+		w.Header().Set("Accept-Ranges", "bytes")
+	}
+	if resp.StatusCode == http.StatusPartialContent {
+		if cl := resp.Header.Get("Content-Length"); cl != "" {
+			w.Header().Set("Content-Length", cl)
+		}
+	}
+
+	// Media segments are small, but a slow client reading a large one can
+	// still outrun the server-wide 60s WriteTimeout; lift it for this
+	// response, the request context cancels on client disconnect anyway.
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
+
+	// VOD segments and subtitles are immutable bytes: an identical proxy URL
+	// always serves identical bytes (upstream tokens live inside the url=
+	// param, so a rotation is a new URL, a cached copy can never outlive
+	// its token). Mark them cacheable for a year so a shared edge absorbs
+	// repeat views instead of every playback re-burning EC2 egress. Only
+	// full 200s get immutable; 206 ranges are cached per-range without it,
+	// and errors (404/5xx) keep the no-store default. Keys keep their own
+	// max-age=300 branch above.
+	if isFlixcloudSource(decodedURL) {
+		// Token-bound bytes: a shared edge holding these past the JWT window
+		// serves a dead master to every viewer that shares the cache key.
+		w.Header().Set("Cache-Control", "private, no-store")
+	} else if resp.StatusCode == http.StatusOK {
+		cacheableMediaHeaders(w, "public, max-age=31536000, immutable")
+	} else if resp.StatusCode == http.StatusPartialContent {
+		cacheableMediaHeaders(w, "public, max-age=31536000")
+	}
+	w.Header().Set("Content-Type", ct)
+	// Forward upstream Content-Length on full 200s so Cloudflare and clients
+	// can size the transfer (avoids chunked encoding and improves edge
+	// delivery). 206 already carries Content-Length from the Range pass-through.
+	if resp.StatusCode == http.StatusOK {
+		if cl := resp.Header.Get("Content-Length"); cl != "" {
+			w.Header().Set("Content-Length", cl)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	buf := make([]byte, 1<<20)
+	if n, err := io.CopyBuffer(w, resp.Body, buf); err != nil {
+		// The status line is already sent; the client will see a truncated
+		// chunked response. Log it so upstream drops are distinguishable
+		// from nginx/app-level truncation.
+		h.log.Warn().Err(err).Int64("bytes_copied", n).Str("proxy_url", decodedURL).Msg("proxy stream copy aborted")
+	}
+}
+
+// cacheableMediaHeaders marks a public, credentialless media response so a
+// shared edge cache stores ONE variant for all origins. Media here is
+// public (allowlisted CDNs only) and players fetch it without credentials,
+// so ACAO '*' is safe, and required, because an echoed origin would pin
+// the cached variant to one site. Vary: Origin (set site-wide by the CORS
+// middleware) is dropped for the same reason: keeping it fragments the
+// edge cache per Origin header.
+func cacheableMediaHeaders(w http.ResponseWriter, cacheControl string) {
+	w.Header().Set("Cache-Control", cacheControl)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Del("Access-Control-Allow-Credentials")
+	w.Header().Del("Vary")
+}
+
+func looksLikeM3u8Bytes(body []byte) bool {
+	return strings.HasPrefix(strings.TrimSpace(string(body)), "#EXTM3U")
+}
+
+// logUnwrappedFlixcloud warns ONLY when a flixcloud body still looks wrapped
+// after decoding — the single signal that the XOR key set no longer covers
+// what the CDN is serving (key rotation the fallback didn't capture). Healthy
+// decodes stay silent so the journal stays clean.
+func logUnwrappedFlixcloud(h *Handlers, decodedURL, via string, body []byte) {
+	t := strings.TrimSpace(string(body))
+	if strings.HasPrefix(t, "#EXTM3U") || len(body) < 32 {
+		return
+	}
+	h.log.Warn().Str("via", via).Str("proxy_url", decodedURL).Int("bytes", len(body)).
+		Msg("flixcloud playlist still wrapped after decode - key set stale?")
+}
+
+// serveRewrittenPlaylist answers a playlist request from raw upstream bytes:
+// the rewrite (child-URI proxying, the al audio strip) runs on every
+// request so nothing request-specific is ever shared between clients,
+// both the live-fetch path and the VOD cache path answer through here.
+func (h *Handlers) serveRewrittenPlaylist(w http.ResponseWriter, r *http.Request, raw []byte, decodedURL, headersJSON, al string, status int) {
+	// Behind a reverse proxy, r.Host may be the loopback bind address;
+	// emitting that address makes a remote browser request 127.0.0.1 on its
+	// own machine.
+	proxyBase := requestPublicBaseURL(r)
+	rewritten := h.rewriteHLSPlaylist(string(raw), decodedURL, headersJSON, proxyBase, al)
+	if len(rewritten) < 1500 {
+		h.log.Debug().Str("playlist_body", rewritten).Str("proxy_url", decodedURL).Msg("rewritten HLS playlist")
+	} else {
+		h.log.Debug().Str("playlist_preview", rewritten[:1500]).Str("proxy_url", decodedURL).Msg("rewritten HLS playlist (truncated)")
+	}
+	// Playlists are tiny but re-fetched constantly (hls.js polling, quality
+	// switches, prewarm HEADs). 300s of edge is still far below the 3-4h
+	// upstream token lifetime, so cached copies always carry valid tokens.
+	cacheControl := "public, max-age=300"
+	if isFlixcloudSource(decodedURL) {
+		cacheControl = "private, no-store"
+	}
+	cacheableMediaHeaders(w, cacheControl)
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
+	w.WriteHeader(status)
+	w.Write([]byte(rewritten))
+}
+
+// Download proxies a direct video download URL through the backend so the
+// client never needs to handle CDN headers or CORS restrictions. Unlike the
+// media Proxy endpoint, this handler streams the full file and sets
+// Content-Disposition so the client can save it locally.
+func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store, private")
+
+	targetURL := r.URL.Query().Get("url")
+	if targetURL == "" {
+		h.respondError(w, http.StatusBadRequest, "url parameter required")
+		return
+	}
+
+	decodedURL, err := url.QueryUnescape(targetURL)
+	if err != nil {
+		decodedURL = targetURL
+	}
+
+	parsed, err := url.Parse(decodedURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		h.respondError(w, http.StatusBadRequest, "invalid URL scheme")
+		return
+	}
+	if port := parsed.Port(); port != "" && blockedProxyPorts[port] {
+		h.respondError(w, http.StatusForbidden, "download target port not allowed")
+		return
+	}
+	if host := strings.ToLower(parsed.Hostname()); isNuisanceProxyHost(host) || validateProxyTarget(host) != nil {
+		h.respondError(w, http.StatusForbidden, "download target not allowed")
+		return
+	} else if !isAllowedProxyHost(host) {
+		// Same boundary as the media proxy: without the CDN allowlist this
+		// endpoint would be a general public relay.
+		h.log.Warn().Str("download_host", host).Msg("download host not on CDN allowlist")
+		h.respondError(w, http.StatusForbidden, "download target not allowed")
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), "GET", decodedURL, nil)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid URL")
+		return
+	}
+
+	headersJSON := r.URL.Query().Get("headers")
+	applyProxyQueryHeaders(req, headersJSON)
+
+	// Same shed contract as the media proxy above: downloads are full-file
+	// upstream fills that outrun every other content class in both bytes
+	// and held-connection wall time, so they count against the same cap.
+	released, limiterOK := proxyFills.acquire(r.Context())
+	if !limiterOK {
+		w.Header().Set("Retry-After", "3")
+		h.log.Warn().Str("download_host", parsed.Hostname()).Msg("download fill limiter shed upstream fetch")
+		h.respondError(w, http.StatusServiceUnavailable, "proxy busy, retry shortly")
+		return
+	}
+	defer released()
+
+	resp, err := h.downloadClient.Do(req)
+	if err != nil {
+		h.log.Warn().Err(err).Str("download_url", decodedURL).Msg("download proxy failed")
+		h.respondError(w, http.StatusBadGateway, "download source unreachable")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		h.respondError(w, resp.StatusCode, fmt.Sprintf("download source returned %d", resp.StatusCode))
+		return
+	}
+
+	// Cap download size so one client can't hold a connection and the
+	// proxy fill semaphore indefinitely with a multi-GB file.
+	const downloadMaxBytes = 200 << 20 // 200 MiB
+	body := io.LimitReader(resp.Body, downloadMaxBytes)
+
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "video/mp4"
+	}
+
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		w.Header().Set("Content-Range", cr)
+	}
+	// Full-file downloads outrun the server-wide 60s WriteTimeout; lift the
+	// write deadline for this response (the request context still bounds it).
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Disposition", "attachment")
+	w.WriteHeader(resp.StatusCode)
+	io.CopyBuffer(w, body, make([]byte, 1<<20))
+}
+
+func requestPublicBaseURL(r *http.Request) string {
+	scheme := "https"
+	if r.TLS == nil && !strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https") {
+		scheme = "http"
+	}
+	host := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0])
+	if host == "" {
+		host = r.Host
+	}
+	return scheme + "://" + host
+}
+
+func proxyRedirectBlocked(status int) bool {
+	return status >= http.StatusMultipleChoices && status < http.StatusBadRequest
+}
+
+// stripProxyNonce removes the legacy cache-busting "rn" query parameter from
+// a proxied URL. The playlist rewrite no longer emits it (stable URLs are
+// what make edge caching possible); this stays so old playlists still in
+// the wild keep working. It must never reach the upstream CDN.
+//
+// The query is only rebuilt when "rn" is actually present, and the rebuild
+// keeps the surviving params' original bytes and order. A ParseQuery+Encode
+// round-trip would sort the params and append "=" to nameless ones, which
+// breaks CDNs that sign the raw query verbatim, animeheaven signs
+// ?<md5>&<md5> order-sensitively and answers 404 to the re-encoded form.
+func stripProxyNonce(u string) string {
+	idx := strings.IndexByte(u, '?')
+	if idx < 0 {
+		return u
+	}
+	raw := u[idx+1:]
+	hasRN := false
+	kept := make([]string, 0, 8)
+	for _, part := range strings.Split(raw, "&") {
+		if part == "" {
+			continue
+		}
+		name := part
+		if eq := strings.IndexByte(part, '='); eq >= 0 {
+			name = part[:eq]
+		}
+		// rn is appended literally (&rn=<unixnano>), but accept an
+		// encoded form too so a stray %72n= cannot leak upstream.
+		if name == "rn" || strings.EqualFold(mustQueryUnescape(name), "rn") {
+			hasRN = true
+			continue
+		}
+		kept = append(kept, part)
+	}
+	if !hasRN {
+		return u
+	}
+	if len(kept) == 0 {
+		return u[:idx]
+	}
+	return u[:idx+1] + strings.Join(kept, "&")
+}
+
+// mustQueryUnescape decodes name for the rn comparison, falling back to the
+// raw form when it is not valid percent-encoding.
+func mustQueryUnescape(name string) string {
+	if dec, err := url.QueryUnescape(name); err == nil {
+		return dec
+	}
+	return name
+}
+
+func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, error) {
+	// The uTLS fingerprinting chain (h2 → h1 → native Go TLS) exists to get
+	// past CDN bot detection. Every transport dials through baseDialer, whose
+	// ssrfGuardControl re-validates the resolved IP on each connection, so
+	// redirects to private targets are rejected at dial time and no client
+	// follows redirects at all (noRedirects).
+	if !https {
+		return h.proxyHTTPClient.Do(req)
+	}
+
+	// A Cloudflare 403 challenge is a *successful* HTTP response, so a
+	// transport that trips bot detection does not surface as an error.
+	// Fall through the chain on 403/429 as well; the final fallback is a
+	// plain-Go-TLS IPv4-only client whose response is returned as-is.
+	chain := []struct {
+		client *http.Client
+		last   bool
+	}{
+		{h.proxyH2Client, false},
+		{h.proxyH1Client, false},
+		{h.proxyGoTLSClient, false},
+		// ponytail: IPv4-only plain Go TLS end of chain, for hosts (e.g.
+		// settlar) where Cloudflare blocks IPv6 egress outright.
+		{h.proxyGoTLS4Client, true},
+	}
+
+	// Remember which transport last won for this host. Without the memo,
+	// every proxied segment re-pays the losing transports' TLS handshakes
+	// and 403 roundtrips before reaching the winner — playback crawls.
+	host := req.URL.Host
+	if entry, ok := proxyTransportMemo.Load(host); ok && time.Since(entry.(proxyTransportEntry).at) < proxyMemoTTL {
+		resp, err := entry.(proxyTransportEntry).client.Do(req)
+		if err == nil && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
+			return resp, nil
+		}
+		if err == nil {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+		}
+		// Winner stopped working (or errored): forget it and walk the chain.
+		proxyTransportMemo.Delete(host)
+	}
+
+	var lastErr error
+	for _, c := range chain {
+		resp, err := c.client.Do(req)
+		if c.last {
+			return resp, err
+		}
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+			// Drain and close so the connection can be reused.
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			lastErr = fmt.Errorf("upstream %d on transport attempt", resp.StatusCode)
+			continue
+		}
+		proxyTransportMemo.Store(host, proxyTransportEntry{client: c.client, at: time.Now()})
+		return resp, nil
+	}
+	return nil, lastErr
+}
+
+const proxyMemoTTL = 10 * time.Minute
+
+type proxyTransportEntry struct {
+	client *http.Client
+	at     time.Time
+}
+
+// proxyTransportMemo maps upstream host -> the transport that last got a
+// clean response there. Entries expire after proxyMemoTTL or on a 403/429.
+var proxyTransportMemo sync.Map
+
+// applyProxyQueryHeaders applies the ?headers= JSON to a proxy upstream
+// request exactly as the media proxy does: filter dangerous headers, add
+// the referer/UA defaults for known CDN classes, and disable compression
+// (the uTLS transports don't auto-decompress; gzipped upstream bytes would
+// corrupt AES-128 keys and segment data).
+func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
+	// Disable compression, the uTLS/http2 transport doesn't auto-decompress
+	// like a default http.Transport does. Upstream gzipped bytes would arrive
+	// garbled, corrupting AES-128 keys and segment data.
+	req.Header.Set("Accept-Encoding", "identity")
+
+	if headersJSON != "" {
+		var headers map[string]string
+		if json.Unmarshal([]byte(headersJSON), &headers) == nil {
+			for k, v := range headers {
+				// ponytail: strip dangerous headers to prevent injection
+				lower := strings.ToLower(k)
+				if lower == "host" || lower == "transfer-encoding" || lower == "connection" ||
+					lower == "proxy-connection" || lower == "upgrade" || lower == "te" ||
+					strings.HasPrefix(lower, "x-") {
+					continue
+				}
+				req.Header.Set(k, v)
+			}
+		}
+	}
+
+	// Set referer for CDNs that require it, client headers take priority where provided
+	if req.Header.Get("Referer") == "" {
+		u := strings.ToLower(req.URL.String())
+		if strings.Contains(u, "uwucdn") || strings.Contains(u, "owocdn") || strings.Contains(u, "185.237.106.79") {
+			req.Header.Set("Referer", "https://kwik.cx/")
+			req.Header.Set("Origin", "https://kwik.cx")
+		} else if strings.Contains(u, "flixcloud") {
+			req.Header.Set("Referer", "https://flixcloud.cc/")
+		} else if strings.Contains(u, "ninstream") {
+			req.Header.Set("Referer", "https://ninstream.com")
+		}
+	}
+	// Hotlink-locked file hosts always take the site referer, even over a
+	// provider-default one: mp4upload answers provider referers (or
+	// empty) with 403 while the site referer gets 206 for the same
+	// token (measured live).
+	if strings.Contains(strings.ToLower(req.URL.String()), "mp4upload") {
+		req.Header.Set("Referer", "https://mp4upload.com/")
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	}
+	// The zenbu CDN family (rotating worker domains) locked its edges to
+	// Megaplay's player referer on 2026-11-03: zen-bu.cc or empty referer
+	// 403 in ~40ms, megaplay.buzz answers 200 (measured live). Cached
+	// playlists embed the old zen-bu.cc headers in the url= param, so the
+	// override happens here at fetch time, not just in the provider.
+	if strings.Contains(strings.ToLower(req.Header.Get("Referer")), "zen-bu.cc") {
+		req.Header.Set("Referer", "https://megaplay.buzz/")
+		req.Header.Set("Origin", "https://megaplay.buzz")
+	}
+}
+
+func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, al string) string {
+	// Strip the wrong track from dual-audio masters BEFORE any URI rewriting:
+	// dropped lines never get proxied, and the raw master keeps both
+	// renditions available for the other language's request (see
+	// stripAudioRenditions in proxy_audio.go).
+	content = stripAudioRenditions(content, al)
+	lines := strings.Split(content, "\n")
+
+	// Only a playlist we fetched from an allowed host may vouch for the hosts
+	// it references. Proxy() gates on isAllowedProxyHost before fetching, so
+	// in production this holds by construction; re-checking keeps the trust
+	// chain explicit and correct if this is ever called from elsewhere.
+	vouching := false
+	if pb, err := url.Parse(baseURL); err == nil {
+		vouching = isAllowedProxyHost(strings.ToLower(pb.Hostname()))
+	}
+	learnPlaylistTarget := func(rawURL string) {
+		if !vouching {
+			return
+		}
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return
+		}
+		// A trusted playlist may name any media host, including extension-less
+		// segment URLs (observed: p1.ipstatp.com/obj/ad-site-i18n/...). The
+		// dialer SSRF guard plus static allowlist gate remain the boundary;
+		// the media-path filter was dropping real segment hosts.
+		LearnHostFromPlaylist(u.Hostname())
+	}
+
+	headersParam := ""
+	if headersJSON != "" {
+		headersParam = "&headers=" + url.QueryEscape(headersJSON)
+	}
+	// Child URIs are STABLE across sessions on purpose: identical upstream
+	// bytes get identical proxy URLs, so a shared edge cache (Cloudflare)
+	// serves repeat views instead of every playback re-burning EC2 egress.
+	// (There used to be a per-rewrite &rn=<UnixNano> nonce here; it made
+	// every session's segment URLs unique and held the edge hit ratio at
+	// zero. stripProxyNonce is kept so old playlists still in the wild
+	// keep working, it is stripped before dialing upstream.)
+	// Propagate the audio language on every rewritten child URI so nested
+	// playlist fetches keep the dual-audio strip context.
+	alParam := ""
+	if al != "" {
+		alParam = "&al=" + al
+	}
+
+	isEncrypted := false
+	encKeyURI := ""
+	segmentNumRe := regexp.MustCompile(`segment-(\d+)-`)
+
+	// alreadyProxied reports whether a URI line is itself one of our proxy
+	// URLs. This happens when an upstream edge serves a stale cached copy of
+	// a previously rewritten playlist. Re-wrapping would double-encode the
+	// target and 403 at the proxy gate, so such URIs are passed through
+	// untouched, they already carry their own headers param.
+	alreadyProxied := func(u string) bool {
+		return strings.Contains(u, "/api/v1/proxy?")
+	}
+	// megaSegmentHost matches the TikTok-CDN family megaplay hosts its video
+	// segments on. Those CDNs refuse datacenter IPs (the proxy dial gets
+	// rejected with CDN_BLOCKED) and prefix every response with a 252-byte
+	// canary the client must strip, so they only work fetched directly from
+	// the viewer's browser, exactly like megaplay's own player. Such URIs are
+	// left absolute and unproxied.
+	megaSegmentHost := func(u string) bool {
+		if p, err := url.Parse(u); err == nil {
+			h := strings.ToLower(p.Hostname())
+			return strings.HasSuffix(h, "tiktokcdn.com") || strings.HasSuffix(h, "ipstatp.com") ||
+				strings.HasSuffix(h, "ibyteimg.com") || h == "yoot.akirax.buzz"
+		}
+		return false
+	}
+
+	for i, line := range lines {
+		original := strings.TrimSpace(line)
+
+		// Handle any HLS tag with URI="..." attribute (#EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, etc.)
+		if strings.HasPrefix(original, "#") && strings.Contains(original, "URI=") {
+			re := regexp.MustCompile(`URI="([^"]+)"`)
+			rewritten := re.ReplaceAllStringFunc(original, func(match string) string {
+				parts := strings.SplitN(match, "=", 2)
+				if len(parts) != 2 {
+					return match
+				}
+				uri := strings.Trim(parts[1], "\"")
+				absoluteURL := resolveURL(uri, baseURL)
+				if alreadyProxied(absoluteURL) {
+					return match
+				}
+				learnPlaylistTarget(absoluteURL)
+				if !megaSegmentHost(absoluteURL) && (needsProxyRewrite(absoluteURL) || headersJSON != "") {
+					proxied := fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, alParam)
+					return fmt.Sprintf("URI=\"%s\"", proxied)
+				}
+				return fmt.Sprintf("URI=\"%s\"", absoluteURL)
+			})
+			if strings.Contains(original, "METHOD=AES-128") {
+				isEncrypted = true
+				if match := regexp.MustCompile(`URI="([^"]+)"`).FindStringSubmatch(rewritten); len(match) >= 2 {
+					encKeyURI = match[1]
+				}
+			}
+			lines[i] = rewritten
+			continue
+		}
+
+		// #EXTINF and other non-URI HLS tags, left unchanged
+		if strings.HasPrefix(original, "#") {
+			continue
+		}
+
+		// Skip empty lines
+		if original == "" {
+			continue
+		}
+
+		// Resolve child URLs exactly like a player (RFC 3986 against the
+		// playlist URL): root-relative (/cdn/x), relative (seg.ts),
+		// protocol-relative and absolute forms.
+		absoluteURL := resolveURL(original, baseURL)
+		if alreadyProxied(absoluteURL) {
+			lines[i] = original
+			continue
+		}
+		learnPlaylistTarget(absoluteURL)
+
+		// If encrypted, insert per-segment KEY tag with file-number-based IV
+		// ponytail: CDN uses file number as IV (not MEDIA-SEQUENCE), and the
+		// playlist skips segments 2-3, so hls.js default MEDIA-SEQ IV is wrong.
+		if isEncrypted && encKeyURI != "" {
+			if matches := segmentNumRe.FindStringSubmatch(original); len(matches) >= 2 {
+				num, _ := strconv.ParseInt(matches[1], 10, 64)
+				iv := fmt.Sprintf("0x%032x", num)
+				// hls.js indexes LevelKey by URI, same URI skips IV update.
+				// Append segment number to force a separate LevelKey per segment.
+				keyTag := fmt.Sprintf(`#EXT-X-KEY:METHOD=AES-128,URI="%s&sn=%d",IV=%s`, encKeyURI, num, iv)
+				if megaSegmentHost(absoluteURL) {
+					lines[i] = keyTag + "\n" + absoluteURL
+				} else if headersJSON != "" || needsProxyRewrite(absoluteURL) {
+					lines[i] = keyTag + "\n" + fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, alParam)
+				} else {
+					lines[i] = keyTag + "\n" + absoluteURL
+				}
+				continue
+			}
+		}
+
+		if megaSegmentHost(absoluteURL) {
+			lines[i] = absoluteURL
+		} else if headersJSON != "" || needsProxyRewrite(absoluteURL) {
+			lines[i] = fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, alParam)
+		} else {
+			lines[i] = absoluteURL
+		}
+	}
+
+	result := strings.Join(lines, "\n")
+
+	// VOD playlists without #EXT-X-ENDLIST cause hls.js to loop re-fetching.
+	// Append it if missing, the CDN already returned the full segment list.
+	if strings.Contains(result, "#EXT-X-PLAYLIST-TYPE:VOD") && !strings.Contains(result, "#EXT-X-ENDLIST") {
+		result += "\n#EXT-X-ENDLIST"
+	}
+
+	return result
+}
+
+func needsProxyRewrite(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return !isAllowedProxyHost(parsed.Hostname()) || hasKnownRewriteKeys(rawURL)
+}
+
+// hasKnownRewriteKeys returns true for CDN hostnames that must be proxied even
+// if they're on the allowlist, these are hosts where the player's direct
+// request would be rejected at the CDN without custom headers or transport
+// (e.g. uTLS-required hosts).
+func hasKnownRewriteKeys(rawURL string) bool {
+	lower := strings.ToLower(rawURL)
+	return strings.Contains(lower, "flixcloud") ||
+		strings.Contains(lower, "ninstream") ||
+		strings.Contains(lower, "uwucdn") ||
+		strings.Contains(lower, "owocdn") ||
+		strings.Contains(lower, "kotocdn") ||
+		strings.Contains(lower, "vivibebe") ||
+		strings.Contains(lower, "wixmp") ||
+		strings.Contains(lower, "anidb") ||
+		strings.Contains(lower, "animegg") ||
+		strings.Contains(lower, "nekostream") ||
+		strings.Contains(lower, "watching.onl") ||
+		strings.Contains(lower, "krussdomi") ||
+		strings.Contains(lower, "mewstream") ||
+		strings.Contains(lower, "megaplay") ||
+		strings.Contains(lower, "fast4speed") ||
+		strings.Contains(lower, "ans-bio-video") ||
+		strings.Contains(lower, "185.237.106.79")
+}
+
+// resolveURL absolutizes a playlist child URI against the playlist URL
+// per RFC 3986 (ResolveReference): root-relative (/cdn/x), relative
+// (seg.ts), protocol-relative (//h/x) and absolute forms all resolve like
+// a player resolves them. String concatenation got root-relative legs wrong
+// (echovideo variant legs /cdn/<hash> became host/cdn//cdn/<hash>).
+// isPlaylistBody reports whether raw bytes open with an HLS playlist
+// signature. The proxy uses it to catch playlist legs that no URL or
+// content-type hint identifies (query-suffixed masters, extension-less
+// variant URLs, cloaked image/jpeg types), and to keep binary that trips
+// a hint (token containing "m3u8") out of the playlist rewriter.
+func isPlaylistBody(b []byte) bool {
+	return bytes.HasPrefix(bytes.TrimSpace(b), []byte("#EXTM3U"))
+}
+
+// playlistAction is how the isHLS branch must treat one upstream response.
+type playlistAction int
+
+const (
+	// playlistServe: a whole playlist, cache the raw bytes and rewrite.
+	playlistServe playlistAction = iota
+	// playlistMedia: a media body behind a playlist-looking URL, stream it
+	// through the normal opaque media path instead.
+	playlistMedia
+	// playlistReject: error text or a truncated playlist, clean 502.
+	playlistReject
+)
+
+// classifyPlaylistResponse decides the fate of an upstream response inside
+// the HLS branch.
+//
+// The important case is 206: extension-less playlist legs (ReCloud's
+// /p?t=...) don't match the ".m3u8" Range-forwarding exclusion, so a player
+// that ranges every request gets its ranged playlist upstream-answered with
+// 206. bytes=0- carries the COMPLETE playlist and must be served, answering
+// 502 here (the old behavior) failed every ranged playlist fetch the moment
+// the 45 s VOD cache went cold and stopped playback mid-video. Anything
+// short of the full file is never rewritten: half a playlist would produce
+// fake URLs, and a media body falls through to the 206 passthrough.
+func classifyPlaylistResponse(status int, contentRange string, body []byte) playlistAction {
+	switch {
+	case status == http.StatusPartialContent:
+		if !isPlaylistBody(body) {
+			return playlistMedia
+		}
+		if partialCoversWhole(contentRange, len(body)) {
+			return playlistServe
+		}
+		return playlistReject
+	case status != http.StatusOK:
+		return playlistReject
+	case !isPlaylistBody(body):
+		return playlistMedia
+	default:
+		return playlistServe
+	}
+}
+
+// partialCoversWhole reports whether a 206 Content-Range describes the whole
+// resource: "bytes 0-1088/1089" with start 0, end n-1 and total n equal to
+// the received length. Only such a response may be cached and rewritten as a
+// full playlist.
+func partialCoversWhole(contentRange string, n int) bool {
+	spec, ok := strings.CutPrefix(contentRange, "bytes ")
+	if !ok {
+		return false
+	}
+	span, total, ok := strings.Cut(spec, "/")
+	if !ok {
+		return false
+	}
+	start, end, ok := strings.Cut(span, "-")
+	if !ok {
+		return false
+	}
+	totalN, err := strconv.Atoi(total)
+	if err != nil || totalN != n {
+		return false
+	}
+	startN, err := strconv.Atoi(start)
+	if err != nil || startN != 0 {
+		return false
+	}
+	endN, err := strconv.Atoi(end)
+	return err == nil && endN == n-1
+}
+
+func resolveURL(uri, baseURL string) string {
+	if strings.HasPrefix(uri, "http") {
+		return uri
+	}
+	if strings.HasPrefix(uri, "//") {
+		return "https:" + uri
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return uri
+	}
+	if ref, err := url.Parse(uri); err == nil {
+		return base.ResolveReference(ref).String()
+	}
+	return uri
+}

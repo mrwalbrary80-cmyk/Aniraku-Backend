@@ -1,0 +1,140 @@
+package netguard
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"strings"
+	"sync"
+	"syscall"
+)
+
+// Control is a net.Dialer.Control hook. It runs after DNS resolution,
+// immediately before the socket connects, and inspects the concrete IP the OS
+// is about to dial. Validating here, rather than on the hostname, covers every
+// lookup exploit at once: DNS rebinding, HTTP redirects, and alternate IP encodings
+// all funnel through this same check, because they all must eventually connect
+// to an actual address. No private address passes: the retired relay
+// splice exemption (10.77.0.0/30) is gone, private space is private
+// again, and no egress trick re-grants it.
+//
+// The one exception is deliberate, operator-granted and exact: hosts listed
+// in ANIRAKU_PRIVATE_BRIDGE_HOSTS (comma-separated ip:port, currently the
+// self-hosted AniList mirror collocated with the backend on the same VPS).
+// The match happens on the concrete post-DNS ip:port, so redirects or a
+// DNS trick to any OTHER private address still fail; the media proxy's
+// allowlist path never consults this, proxy targets stay public-only.
+func Control(_ /*network*/ string, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("ssrf guard: cannot parse address %q: %w", address, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("ssrf guard: unresolved address %q", host)
+	}
+	if allowedBridge(address) {
+		return nil
+	}
+	if !IsPublicIP(ip) {
+		return fmt.Errorf("ssrf guard: blocked non-public address %s", ip)
+	}
+	return nil
+}
+
+// allowedBridge reports whether address (ip:port as the dialer presented
+// it) is on the bridge exception list. The list is re-derived
+// whenever ANIRAKU_PRIVATE_BRIDGE_HOSTS changes value, so it can be
+// adjusted across service restarts and tests can exercise both sides.
+func allowedBridge(address string) bool {
+	raw := os.Getenv("ANIRAKU_PRIVATE_BRIDGE_HOSTS")
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
+	if bridgeRaw != raw {
+		bridgeSet = parseBridges(raw)
+		bridgeRaw = raw
+	}
+	_, ok := bridgeSet[address]
+	return ok
+}
+
+var (
+	bridgeMu  sync.Mutex
+	bridgeRaw string
+	bridgeSet map[string]bool
+)
+
+func parseBridges(raw string) map[string]bool {
+	out := make(map[string]bool)
+	for _, h := range strings.Split(raw, ",") {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		// Canonical form keeps "[::1]:4401"-style IPv6 entries sane; a
+		// dashboard typo like 127.0.0.1:44o1 simply never parses and is
+		// dropped instead of widening the exception.
+		if ap, err := netip.ParseAddrPort(h); err == nil {
+			out[ap.String()] = true
+		}
+	}
+	return out
+}
+
+// IsPublicIP reports whether ip is a globally routable unicast address.
+// Everything else, loopback, private, link-local, CGNAT, ULA, multicast,
+// unspecified, and the cloud metadata address, is rejected.
+func IsPublicIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	// Private ranges: 10/8, 172.16/12, 192.168/16, fc00::/7, plus IsPrivate
+	// covers RFC1918 and RFC4193.
+	if ip.IsPrivate() {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// 100.64.0.0/10 CGNAT (RFC6598), not covered by IsPrivate.
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return false
+		}
+		// 169.254.0.0/16 covers the 169.254.169.254 metadata endpoint;
+		// IsLinkLocalUnicast already rejects it, but be explicit.
+		if ip4[0] == 169 && ip4[1] == 254 {
+			return false
+		}
+		// 0.0.0.0/8 "this host" range.
+		if ip4[0] == 0 {
+			return false
+		}
+		// 240.0.0.0/4, reserved (class E) plus the limited broadcast
+		// 255.255.255.255. IsMulticast only matches 224/4, so this range
+		// must be rejected explicitly.
+		if ip4[0] >= 240 {
+			return false
+		}
+	} else {
+		// IPv4-mapped IPv6 (::ffff:a.b.c.d) is already handled by ip.To4() above.
+		// NAT64 well-known prefix 64:ff9b::/96 wrapping a private v4.
+		if len(ip) == net.IPv6len &&
+			ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b &&
+			ip[4] == 0x00 && ip[5] == 0x00 && ip[6] == 0x00 && ip[7] == 0x00 &&
+			ip[8] == 0x00 && ip[9] == 0x00 && ip[10] == 0x00 && ip[11] == 0x00 {
+			if v4 := net.IPv4(ip[12], ip[13], ip[14], ip[15]); v4 != nil {
+				return IsPublicIP(v4)
+			}
+		}
+	}
+	return true
+}
+
+// NoRedirects rejects every redirect at the client layer. Backing off at the
+// first hop means an upstream cannot bounce this server at an arbitrary
+// internal target, even one the dialer's IP guard would later permit.
+func NoRedirects(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
+}

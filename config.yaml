@@ -1,0 +1,20 @@
+server:
+  host: 0.0.0.0
+  port: 43211
+  ui_dist: ""
+  debug: false
+
+supabase:
+  url: https://ysildkwfjvcewhohuham.supabase.co
+  anon_key: sb_publishable_SFwHQczLn0pJwGsY1y3isg_hkxCCMrr
+  service_key: ""
+  graphql_url: https://graphql.aniraku.tech
+  jwt_aud: authenticated
+
+logging:
+  level: info
+  format: json
+
+update:
+  channel: stable
+  url: https://api.aniraku.app/update

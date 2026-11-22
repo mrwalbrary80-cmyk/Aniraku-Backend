@@ -1,0 +1,375 @@
+package streaming
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+// browserUA is the default probe User-Agent. It MUST be a Windows Chrome
+// UA: the MegaPlay CDN edges (fetch.nexabloom.top et al) serve 403 Cloudflare
+// block pages to the X11/Linux UA while serving the identical request with a
+// Windows UA (isolated live: same URL, same client, same second, X11 403,
+// Windows 200). Every provider probe defaults to this.
+const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+// iosSafariUA is the fallback probe/playback User-Agent for CDNs that
+// gate by UA class instead of IP. Measured live on Sora's segment layer
+// (bl1.advancedairesearchlab.xyz + bl1.habibikun.xyz + ...): every
+// desktop UA (Chrome/Edge/Firefox/Safari), Android UA, curl, python and
+// "no UA" get Cloudflare 403, while iPhone Safari gets 200 with real
+// MPEG-TS bytes (disguised as .jpg). Try this whenever a probe 403s:
+// it costs one request and unlocks sources that are otherwise dropped.
+const iosSafariUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"
+
+// Shared segment-depth probe (lenient verdict).
+//
+// A reachable manifest whose segments are egress-blocked only produces a
+// spinning player (observed: quavex.top and bl1.*.xyz return Cloudflare 403
+// on every header combination while their playlists serve fine). The
+// verdict is deliberately lenient, definitive blocks only (unreachable,
+// non-2xx, HTML error pages), so ambiguous payloads (image cloaks some
+// CDNs serve probes while playing video fine) keep a server listed instead
+// of regressing a working stream.
+//
+// Playlist hops for every probe go through fetchPlaylistCapped: within the
+// VOD cache's 45s TTL a freshly fetched identical master/media body is
+// served from the cache instead of paying the same upstream hop again,
+// repeat /servers rounds (the app re-asks when the user switches servers)
+// and multi-variant probes stop re-dialing identical tokenized playlists.
+// The cache stores exact-URL, raw upstream bytes only (no origin to
+// poison), so a rotated token is a new key and refetches by design.
+func probeSegmentsLenient(ctx context.Context, client *http.Client, masterURL, referer, ua string) bool {
+	mhead, ok := fetchPlaylistCapped(ctx, client, masterURL, referer, ua, 65536, 6*time.Second)
+	if !ok || !strings.Contains(string(mhead), "#EXTM3U") {
+		return false
+	}
+	media := firstPlaylistURL(string(mhead), masterURL)
+	if media == "" {
+		return false
+	}
+	mbody, ok := fetchPlaylistCapped(ctx, client, media, referer, ua, 262144, 6*time.Second)
+	if !ok || !strings.Contains(string(mbody), "#EXTM3U") {
+		return false
+	}
+	seg := firstPlaylistURL(string(mbody), media)
+	if seg == "" {
+		return false
+	}
+	shead, ok := fetchURLCapped(ctx, client, seg, referer, ua, 8192, 8*time.Second)
+	if !ok {
+		return false
+	}
+	return !strings.Contains(strings.ToLower(string(shead)), "<html")
+}
+
+// probePlaylistsLenient verifies a resolved master at playlist depth only:
+// master -> first media playlist must both serve #EXTM3U. Segment bytes are
+// deliberately not fetched, when every hop is served by a relay's own
+// servers (Supaplay's hls-proxy fetches upstream server-side, never through
+// this egress), a segment fetch proves nothing the media playlist did not,
+// while costing 0.3-1.8s on the fan-out's pacing collector. Verdict stays
+// lenient: definitive blocks only (unreachable, non-2xx, non-#EXTM3U).
+func probePlaylistsLenient(ctx context.Context, client *http.Client, masterURL, referer, ua string) bool {
+	mhead, ok := fetchPlaylistCapped(ctx, client, masterURL, referer, ua, 65536, 6*time.Second)
+	if !ok || !strings.Contains(string(mhead), "#EXTM3U") {
+		return false
+	}
+	media := firstPlaylistURL(string(mhead), masterURL)
+	if media == "" {
+		return false
+	}
+	mbody, ok := fetchPlaylistCapped(ctx, client, media, referer, ua, 262144, 6*time.Second)
+	if !ok || !strings.Contains(string(mbody), "#EXTM3U") {
+		return false
+	}
+	return true
+}
+
+// isUpstreamGated reports whether err is an HTTP 403 from upstream, the
+// signature of IP-reputation blocks (Cloudflare challenge pages) rather
+// than a missing episode. Providers map it to a silent skip so a blocked
+// network never errors playback and auto-recovers when the block lifts.
+// Real failures (5xx, parse errors, missing data) still propagate as errors.
+func isUpstreamGated(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "HTTP 403")
+}
+
+// probeMediaFileLenient verifies a direct media file (mp4 and friends) is// actually served from this egress: 2xx + non-HTML bytes judged by magic
+// (ftyp/moof for mp4, TS sync, ID3). Redirects (signed ?for= tokens that
+// 302 to file hosts) are followed like a player follows them.
+func probeMediaFileLenient(ctx context.Context, client *http.Client, fileURL, referer, ua string) bool {
+	body, ok := fetchURLCapped(ctx, client, fileURL, referer, ua, 32768, 10*time.Second)
+	if !ok {
+		return false
+	}
+	return segmentBytesPlayable(body)
+}
+
+// probeSubtitleLenient verifies a subtitle track (VTT) is actually served
+// from this egress: 2xx + WEBVTT magic header. VTT files are plain text,
+// not binary media, so probeMediaFileLenient's magic-byte check would
+// reject them. Some servers prepend a BOM or whitespace before "WEBVTT",
+// so we tolerate leading bytes and check for the signature anywhere in the
+// first 64 bytes.
+func probeSubtitleLenient(ctx context.Context, client *http.Client, fileURL, referer, ua string) bool {
+	body, ok := fetchURLCapped(ctx, client, fileURL, referer, ua, 32768, 10*time.Second)
+	if !ok {
+		return false
+	}
+	head := strings.ToLower(strings.TrimSpace(string(body[:min(64, len(body))])))
+	return strings.HasPrefix(head, "webvtt") || strings.Contains(head, "webvtt")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// probeSegmentsStrict verifies a resolved master playlist is actually
+// playable from this egress, end to end: master -> first media playlist ->
+// first segment must all serve media bytes judged by magic (TS sync,
+// fmp4, nested playlist). HTML block pages and decoy payloads fail. Used
+// where edge alternatives exist (MegaPlay ?s= variants): a stricter
+// verdict is safe because another variant can still win.
+func probeSegmentsStrict(ctx context.Context, client *http.Client, fileURL, origin, ua string) bool {
+	master, ok := fetchPlaylistCapped(ctx, client, fileURL, origin, ua, 64*1024, 6*time.Second)
+	if !ok || !strings.Contains(string(master), "#EXTM3U") {
+		return false
+	}
+	media := firstPlaylistURL(string(master), fileURL)
+	if media == "" {
+		return false
+	}
+	medBody, ok := fetchPlaylistCapped(ctx, client, media, origin, ua, 256*1024, 6*time.Second)
+	if !ok || !strings.Contains(string(medBody), "#EXTM3U") {
+		return false
+	}
+	seg := firstPlaylistURL(string(medBody), media)
+	if seg == "" {
+		return false
+	}
+	head, ok := fetchURLCapped(ctx, client, seg, origin, ua, 32768, 8*time.Second)
+	if !ok {
+		return false
+	}
+	return segmentBytesPlayable(head)
+}
+
+// normalizeOriginReferer ensures an origin-style referer carries the
+// trailing slash real browsers send ("https://host/"). MegaPlay's CDN
+// edge (fetch.nexabloom.top) 403-Cloudfront-blocks "https://megaplay.buzz"
+// (no slash) while serving the identical request with
+// "https://megaplay.buzz/", measured same client, same second: 403 vs
+// 200. Sending the slashless form made every segment probe read a block
+// page and misreport "blocked from this egress". Referers with an actual
+// path are returned untouched.
+func normalizeOriginReferer(referer string) string {
+	u, err := url.Parse(referer)
+	if err != nil || u.Host == "" {
+		return referer
+	}
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	return u.String()
+}
+
+// fetchURLCapped GETs url with referer/UA, bounding both time and bytes
+// (full GET capped, never Range, identical request shape to players).
+//
+// fetchPlaylistCapped is the playlist variant of the same shape: it serves
+// the hop first from the VOD body cache (45s TTL, exact-URL key, static-
+// playlist gated) and otherwise fetches upstream through fetchURLCapped
+// and stores the result. Probe rounds that re-run within the TTL, repeat
+// /servers rounds and multi-variant sweeps, stop paying the identical
+// upstream hop; playback-startup warm-up is unchanged because the fetch
+// path still stores into the same cache.
+func fetchPlaylistCapped(ctx context.Context, client *http.Client, rawURL, referer, ua string, limit int64, timeout time.Duration) ([]byte, bool) {
+	if body, ok := VODCacheGet(rawURL); ok && int64(len(body)) <= limit {
+		return unwrapFlixcloudBody(rawURL, body), true
+	}
+	body, ok := fetchURLCapped(ctx, client, rawURL, referer, ua, limit, timeout)
+	if ok {
+		body = unwrapFlixcloudBody(rawURL, body)
+		VODCacheSet(rawURL, body)
+	}
+	return body, ok
+}
+
+// unwrapFlixcloudBody strips the base64(XOR(_, pk)) wrapper flixcloud puts
+// around every m3u8 body BEFORE the probe parses it or the VOD cache stores
+// it. Cached-raw wrapped bodies made every downstream consumer (probe
+// segment extraction, the proxy's cache-hit playlist serve) see base64
+// noise instead of #EXTM3U, which blacked out flixcloud playback entirely.
+// Idempotent: plaintext bodies pass through unchanged, so this is safe to
+// apply at every consumption point.
+func unwrapFlixcloudBody(rawURL string, body []byte) []byte {
+	u, err := url.Parse(rawURL)
+	if err != nil || !strings.HasSuffix(strings.ToLower(u.Hostname()), "flixcloud.cc") {
+		return body
+	}
+	return DecodeFlixcloudPlaylist(body)
+}
+
+func fetchURLCapped(ctx context.Context, client *http.Client, rawURL, referer, ua string, limit int64, timeout time.Duration) ([]byte, bool) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, false
+	}
+	if ua == "" {
+		ua = browserUA
+	}
+	req.Header.Set("User-Agent", ua)
+	if referer != "" {
+		req.Header.Set("Referer", normalizeOriginReferer(referer))
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return nil, false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if err != nil {
+		return nil, false
+	}
+	return body, true
+}
+
+// tsAudioLangs scans MPEG-TS segment bytes for ISO-639 audio language
+// descriptors (descriptor tag 0x0A in the PMT): the ground-truth answer to
+// which audio a stream carries, independent of playlist labels or file
+// names (verified live: a mislabeled "dub" stream declared jpn here).
+// Returns the normalized two-letter set; empty means unknown (not TS, no
+// PMT in the sampled bytes, or no language descriptors), never a verdict
+// by itself.
+func tsAudioLangs(seg []byte) map[string]bool {
+	out := map[string]bool{}
+	packets := splitTS(seg)
+	if len(packets) == 0 {
+		return out
+	}
+	pmtPID := tsPMTPID(packets)
+	if pmtPID < 0 {
+		return out
+	}
+	pmt := tsSection(packets, pmtPID, 0x02)
+	if len(pmt) == 0 {
+		return out
+	}
+	// PMT body: skip to program_info, then walk elementary streams.
+	pos := 12
+	end := len(pmt) - 4 // trailing CRC
+	if pos > end {
+		return out
+	}
+	pos += int((int(pmt[10])&0x0F)<<8 | int(pmt[11]))
+	for pos+5 <= end {
+		infoLen := int((int(pmt[pos+3])&0x0F)<<8 | int(pmt[pos+4]))
+		dp, dend := pos+5, pos+5+infoLen
+		for dp+2 <= dend && dp+2 <= end {
+			tag, dlen := pmt[dp], int(pmt[dp+1])
+			if tag == 0x0A && dp+2+4 <= dend && dp+2+4 <= end {
+				if code := normalizeAudioLang(string(pmt[dp+2 : dp+5])); code != "" {
+					out[code] = true
+				}
+			}
+			dp += 2 + dlen
+		}
+		pos = dend
+	}
+	return out
+}
+
+// splitTS cuts raw bytes into 188-byte TS packets, resyncing on 0x47.
+func splitTS(data []byte) [][]byte {
+	var out [][]byte
+	i := 0
+	for i < len(data) {
+		if data[i] != 0x47 {
+			i++
+			continue
+		}
+		if i+188 > len(data) {
+			break
+		}
+		out = append(out, data[i:i+188])
+		i += 188
+	}
+	return out
+}
+
+// tsPayload returns a packet's PID and its payload bytes (past adaptation
+// field and pointer field), or nil when it carries none.
+func tsPayload(p []byte) (int, []byte) {
+	if len(p) < 188 || p[0] != 0x47 {
+		return -1, nil
+	}
+	pid := int(p[1]&0x1F)<<8 | int(p[2])
+	afc := (p[3] >> 4) & 0x03
+	if afc == 0 || afc == 2 {
+		return pid, nil
+	}
+	off := 4
+	if afc == 3 {
+		off += 1 + int(p[4])
+	}
+	if off >= len(p) {
+		return pid, nil
+	}
+	if p[1]&0x40 != 0 {
+		off += 1 + int(p[off])
+	}
+	if off >= len(p) {
+		return pid, nil
+	}
+	return pid, p[off:]
+}
+
+// tsSection reassembles one PSI section (tableID) for a PID across packets.
+func tsSection(packets [][]byte, pid int, tableID byte) []byte {
+	var buf []byte
+	for _, p := range packets {
+		got, pl := tsPayload(p)
+		if got != pid || len(pl) == 0 {
+			continue
+		}
+		buf = append(buf, pl...)
+		if len(buf) > 8 && buf[0] == tableID {
+			secLen := int(buf[1]&0x0F)<<8 | int(buf[2])
+			if len(buf) >= 3+secLen {
+				return buf[:3+secLen]
+			}
+		}
+	}
+	return nil
+}
+
+// tsPMTPID finds the PMT PID from the PAT (PID 0), or -1.
+func tsPMTPID(packets [][]byte) int {
+	pat := tsSection(packets, 0, 0x00)
+	if len(pat) < 12 {
+		return -1
+	}
+	pos, end := 8, len(pat)-4
+	for pos+4 <= end {
+		if pat[pos]|pat[pos+1] != 0 {
+			return int(pat[pos+2]&0x1F)<<8 | int(pat[pos+3])
+		}
+		pos += 4
+	}
+	return -1
+}
